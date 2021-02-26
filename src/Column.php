@@ -26,6 +26,7 @@ class Column
     public $additionalSelects = [];
     public $filterView;
     public $align = 'left';
+    public $preventExport;
 
     public static function name($name)
     {
@@ -126,6 +127,13 @@ class Column
         return $this;
     }
 
+    public function excludeFromExport()
+    {
+        $this->preventExport = true;
+
+        return $this;
+    }
+
     public function linkTo($model, $pad = null)
     {
         $this->callback = function ($value) use ($model, $pad) {
@@ -172,9 +180,9 @@ class Column
         return $this;
     }
 
-    public function editable()
+    public function editable($editable = true)
     {
-        return $this->setType('editable');
+        return $editable ? $this->setType('editable') : $this;
     }
 
     public function isEditable()

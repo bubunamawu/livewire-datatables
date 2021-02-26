@@ -160,7 +160,7 @@ class LivewireDatatable extends Component
         });
 
         return $selects->count() > 1
-            ? new Expression('CONCAT_WS("'.static::SEPARATOR.'" ,'.
+            ? new Expression("CONCAT_WS('".static::SEPARATOR."' ,".
                 collect($selects)->map(function ($select) {
                     return "COALESCE($select, '')";
                 })->join(', ').')')
@@ -175,10 +175,11 @@ class LivewireDatatable extends Component
         ];
     }
 
-    public function getSelectStatements($withAlias = false)
+    public function getSelectStatements($withAlias = false, $export = false)
     {
-        return $this->processedColumns->columns->reject(function ($column) {
-            return $column->scope;
+        return $this->processedColumns->columns
+        ->reject(function ($column) use ($export) {
+            return $column->scope || ($export && $column->preventExport);
         })->map(function ($column) {
             if ($column->select) {
                 return $column;
@@ -209,7 +210,9 @@ class LivewireDatatable extends Component
                     return null;
                 }
                 if ($column->select instanceof Expression) {
-                    return new Expression($column->select->getValue().' AS `'.$column->name.'`');
+                    $sep_string = env('DB_CONNECTION') === 'pgsql' ? '"' : '`';
+
+                    return new Expression($column->select->getValue().' AS '.$sep_string.$column->name.$sep_string);
                 }
 
                 if (is_array($column->select)) {
@@ -256,7 +259,7 @@ class LivewireDatatable extends Component
                     break;
 
                 case $model instanceof HasMany:
-                    $this->query->withAggregate($relation, $aggregate ?? 'count', $relationColumn, $alias);
+                    $this->query->customWithAggregate($relation, $aggregate ?? 'count', $relationColumn, $alias);
                     $table = null;
                     break;
 
@@ -267,7 +270,7 @@ class LivewireDatatable extends Component
                     break;
 
                 case $model instanceof BelongsToMany:
-                    $this->query->withAggregate($relation, $aggregate ?? 'count', $relationColumn, $alias);
+                    $this->query->customWithAggregate($relation, $aggregate ?? 'count', $relationColumn, $alias);
                     $table = null;
                     break;
 
@@ -286,7 +289,7 @@ class LivewireDatatable extends Component
                     break;
 
                 default:
-                    $this->query->withAggregate($relation, $aggregate ?? 'count', $relationColumn, $alias);
+                    $this->query->customWithAggregate($relation, $aggregate ?? 'count', $relationColumn, $alias);
             }
             if ($table) {
                 $this->performJoin($table, $foreign, $other);
@@ -355,6 +358,7 @@ class LivewireDatatable extends Component
     public function getSortString()
     {
         $column = $this->freshColumns[$this->sort];
+        $dbTable = env('DB_CONNECTION');
 
         switch (true) {
             case $column['sort']:
@@ -373,8 +377,10 @@ class LivewireDatatable extends Component
                 return Str::before($column['select'], ' AS ');
                 break;
 
-            default:
-                return new Expression('`'.$column['name'].'`');
+             default:
+                return $dbTable == 'pgsql'
+                ? new Expression('"'.$column['name'].'"')
+                : new Expression('`'.$column['name'].'`');
                 break;
         }
     }
@@ -682,10 +688,16 @@ class LivewireDatatable extends Component
             : 'count';
     }
 
-    public function buildDatabaseQuery()
+    public function buildDatabaseQuery($export = false)
     {
         $this->query = $this->builder();
-        $this->query->addSelect($this->getSelectStatements(true)->filter()->flatten()->toArray());
+
+        $this->query->addSelect(
+            $this->getSelectStatements(true, $export)
+            ->filter()
+            ->flatten()
+            ->toArray()
+        );
 
         $this->addGlobalSearch()
             ->addScopeColumns()
@@ -710,13 +722,21 @@ class LivewireDatatable extends Component
                     $this->searchableColumns()->each(function ($column, $i) use ($query, $search) {
                         $query->orWhere(function ($query) use ($i, $search) {
                             foreach ($this->getColumnField($i) as $column) {
-                                $query->orWhereRaw('LOWER('.$column.') like ?', "%$search%");
+                                $query->when(is_array($column), function ($query) use ($search, $column) {
+                                    foreach ($column as $col) {
+                                        $query->orWhereRaw('LOWER('.$col.') like ?', "%".strtolower($search)."%");
+                                    }
+                                }, function ($query) use ($search, $column) {
+                                    $query->orWhereRaw('LOWER('.$column.') like ?', "%".strtolower($search)."%");
+                                });
                             }
                         });
                     });
                 });
             }
         });
+
+        $this->page = 1;
 
         return $this;
     }
@@ -773,8 +793,10 @@ class LivewireDatatable extends Component
                 } elseif ($value == 1) {
                     $query->where(DB::raw($this->getColumnField($index)[0]), '>', 0);
                 } elseif (strlen($value)) {
-                    $query->whereNull(DB::raw($this->getColumnField($index)[0]))
-                        ->orWhere(DB::raw($this->getColumnField($index)[0]), 0);
+                    $query->where(function ($query) use ($index) {
+                        $query->whereNull(DB::raw($this->getColumnField($index)[0]))
+                            ->orWhere(DB::raw($this->getColumnField($index)[0]), 0);
+                    });
                 }
             }
         });
@@ -925,7 +947,7 @@ class LivewireDatatable extends Component
                     $row->$name = $this->callbacks[$name]($value, $row);
                 }
 
-                if ($this->search && $this->searchableColumns()->firstWhere('name', $name)) {
+                if ($this->search && ! config('livewire-datatables.suppress_search_highlights') && $this->searchableColumns()->firstWhere('name', $name)) {
                     $row->$name = $this->highlight($row->$name, $this->search);
                 }
             }
@@ -943,13 +965,41 @@ class LivewireDatatable extends Component
             : $value;
     }
 
+    /*  This can be called to apply highlting of the search term to some string.
+     *  Motivation: Call this from your Column::Callback to apply highlight to a chosen section of the result.
+     */
+    public function highlightStringWithCurrentSearchTerm(string $originalString)
+    {
+        if (! $this->search) {
+            return $originalString;
+        } else {
+            return static::highlightString($originalString, $this->search);
+        }
+    }
+
+    /* Utility function for applying highlighting to given string */
+    public static function highlightString(string $originalString, string $searchingForThisSubstring)
+    {
+        $searchStringNicelyHighlightedWithHtml = view(
+            'datatables::highlight',
+            ['slot' => $searchingForThisSubstring]
+        )->render();
+        $stringWithHighlightedSubstring = str_ireplace(
+            $searchingForThisSubstring,
+            $searchStringNicelyHighlightedWithHtml,
+            $originalString
+        );
+
+        return $stringWithHighlightedSubstring;
+    }
+
     public function highlight($value, $string)
     {
         $output = substr($value, stripos($value, $string), strlen($string));
 
         if ($value instanceof View) {
             return $value
-                ->with(['value' => str_ireplace($string, view('datatables::highlight', ['slot' => $output]), $value->gatherData()['value'])]);
+                ->with(['value' => str_ireplace($string, view('datatables::highlight', ['slot' => $output]), $value->gatherData()['value'] ?? $value->gatherData()['slot'])]);
         }
 
         return str_ireplace($string, view('datatables::highlight', ['slot' => $output]), $value);
@@ -964,12 +1014,12 @@ class LivewireDatatable extends Component
     {
         $this->forgetComputed();
 
-        return Excel::download(new DatatableExport($this->getQuery()->get()), 'DatatableExport.xlsx');
+        return Excel::download(new DatatableExport($this->getQuery(true)->get()), 'DatatableExport.xlsx');
     }
 
-    public function getQuery()
+    public function getQuery($export = false)
     {
-        $this->buildDatabaseQuery();
+        $this->buildDatabaseQuery($export);
 
         return $this->query->toBase();
     }
